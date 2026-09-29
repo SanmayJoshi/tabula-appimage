@@ -208,6 +208,12 @@ jobs:
             cp "technology.tabula.appdata.xml" AppDir/usr/share/metainfo/technology.tabula.appdata.xml
           fi
 
+      - name: Bundle libcrypt.so.1
+        run: |
+          mkdir -p AppDir/usr/lib
+          cp -L /lib/x86_64-linux-gnu/libcrypt.so.1 AppDir/usr/lib/
+          test -f AppDir/usr/lib/libcrypt.so.1 || { echo "libcrypt.so.1 missing! Try another source to get it from." >&2; exit 1; }
+      
       - name: Package AppImage and Generate Hashes
         run: |
           REPO_OWNER="${GITHUB_REPOSITORY%/*}"

@@ -173,8 +173,7 @@ JVM_OPTS=(
   "-Xmx1024M"
   "-Dwarbler.port=${CURRENT_PORT}"
   "-Djava.io.tmpdir=${TABULA_HOME_DIR}/tmp"
-  "-Djruby.native.enabled=false"   # use pure-Java POSIX; avoids jffi/jnr-posix native loading
-  "-Djruby.native.verbose=true"
+  #"-Djruby.native.verbose=true" # comment out to reduce log noise
 )
 
 # Parse runtime arguments
@@ -197,5 +196,7 @@ else
   JVM_OPTS+=("-Dtabula.openBrowser=false")
 fi
 
+# limit what the library path exposes. LD_LIBRARY_PATH is inherited by child processes, such as the browser launched via xdg-open. Right now usr/lib contains only libcrypt (the JRE lives in usr/lib/jvm), so the exposure is tiny. If more libraries are bundled later, put them in a subdirectory like usr/lib/compat and point LD_LIBRARY_PATH there instead.
+export LD_LIBRARY_PATH="${HERE}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 # Execute Tabula directly via exec to maintain clean signal propagation (SIGINT/SIGTERM)
 exec "${JAVA_BIN}" "${JVM_OPTS[@]}" ${TABULA_JAVA_OPTS:-} -jar "${TABULA_JAR}" "${USER_ARGS[@]}"
