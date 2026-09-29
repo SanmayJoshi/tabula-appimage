@@ -161,12 +161,20 @@ echo "[Tabula] Launching Tabula server on http://127.0.0.1:${CURRENT_PORT}/"
 # ------------------------------------------------------------------------------
 # 4. Process Flags and Launch
 # ------------------------------------------------------------------------------
+# Writable, exec-capable temp dir and a stable working directory
+TABULA_HOME_DIR="${TABULA_DATA_PATH:-${XDG_DATA_HOME:-$HOME/.local/share}/tabula}"
+mkdir -p "${TABULA_HOME_DIR}/tmp"
+cd "${TABULA_HOME_DIR}" || cd "$HOME" || exit 1
+
 # Note: Passes CURRENT_PORT rather than the static TABULA_PORT
 JVM_OPTS=(
   "-Dfile.encoding=utf-8"
   "-Xms256M"
   "-Xmx1024M"
   "-Dwarbler.port=${CURRENT_PORT}"
+  "-Djava.io.tmpdir=${TABULA_HOME_DIR}/tmp"
+  "-Djruby.native.enabled=false"   # use pure-Java POSIX; avoids jffi/jnr-posix native loading
+  "-Djruby.native.verbose=true"
 )
 
 # Parse runtime arguments
