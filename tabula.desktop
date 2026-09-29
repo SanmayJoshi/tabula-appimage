@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Tabula
+GenericName=PDF Table Extractor
+Comment=Extract tables trapped inside PDF files into CSV or spreadsheets
+Exec=AppRun %F
+Icon=tabula
+Terminal=false
+Categories=Office;Utility;
+MimeType=application/pdf;
+Keywords=pdf;table;extract;csv;data;spreadsheet;
+StartupWMClass=org-nerdpower-tabula-Tabula

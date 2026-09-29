@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+    <id>technology.tabula</id>
+    <metadata_license>CC0-1.0</metadata_license>
+    <project_license>MIT</project_license>
+    <name>Tabula</name>
+    <summary>Extract tables trapped inside PDF files</summary>
+    <description>
+        <p>
+            Tabula is an open-source tool for liberating data tables trapped inside PDF files.
+            It allows you to extract structured data into CSV or Microsoft Excel spreadsheets
+            using an intuitive, local web-based interface.
+        </p>
+    </description>
+    <launchable type="desktop-id">tabula.desktop</launchable>
+    <url type="homepage">https://tabula.technology/</url>
+    <url type="bugtracker">https://github.com/tabulapdf/tabula/issues</url>
+    <provides>
+        <binary>tabula</binary>
+    </provides>
+</component>

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Tabula AppImage Entrypoint
+# ==============================================================================
+set -e
+
+# Resolve directory of AppImage mount point
+HERE="$(dirname "$(readlink -f "${0}")")"
+
+# Configure bundled Eclipse Temurin JRE
+export JAVA_HOME="${HERE}/usr/lib/jvm"
+export PATH="${JAVA_HOME}/bin:${PATH}"
+
+# Preserve pristine host environment for external apps (e.g., host browser)
+export ORIGINAL_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+
+# Runtime defaults
+TABULA_PORT="${TABULA_PORT:-8080}"
+TABULA_JAR="${HERE}/usr/share/tabula/tabula.jar"
+
+# Verify socket availability to avoid collisions on port 8080
+is_port_in_use() {
+  local port="$1"
+  # 1. Native Bash /dev/tcp test
+  if (exec 3<>/dev/tcp/127.0.0.1/"${port}") 2>/dev/null; then
+    exec 3>&-
+    return 0
+  fi
+  # 2. Python fallback
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import socket; s = socket.socket(); s.connect(('127.0.0.1', ${port})); s.close()" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+# Auto-increment port if default 8080 is already occupied
+PORT_SCAN_LIMIT=10
+while is_port_in_use "${TABULA_PORT}"; do
+  echo "[Tabula] Notice: Port ${TABULA_PORT} is in use."
+  TABULA_PORT=$((TABULA_PORT + 1))
+  PORT_SCAN_LIMIT=$((PORT_SCAN_LIMIT - 1))
+  if [ "${PORT_SCAN_LIMIT}" -le 0 ]; then
+    echo "[Tabula] Error: No free port found in range." >&2
+    exit 1
+  fi
+done
+
+echo "[Tabula] Launching Tabula server on http://127.0.0.1:${TABULA_PORT}/"
+
+# Core JVM Flags
+JVM_OPTS=(
+  "-Dfile.encoding=utf-8"
+  "-Xms256M"
+  "-Xmx1024M"
+  "-Dwarbler.port=${TABULA_PORT}"
+)
+
+# Parse runtime arguments
+OPEN_BROWSER="true"
+USER_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --no-browser|-n)
+      OPEN_BROWSER="false"
+      ;;
+    *)
+      USER_ARGS+=("$arg")
+      ;;
+  esac
+done
+
+if [ "${OPEN_BROWSER}" = "true" ]; then
+  JVM_OPTS+=("-Dtabula.openBrowser=true")
+else
+  JVM_OPTS+=("-Dtabula.openBrowser=false")
+fi
+
+# Hand over process control to Java to guarantee deterministic signal propagation (SIGINT/SIGTERM)
+exec "${JAVA_HOME}/bin/java" "${JVM_OPTS[@]}" ${TABULA_JAVA_OPTS:-} -jar "${TABULA_JAR}" "${USER_ARGS[@]}"

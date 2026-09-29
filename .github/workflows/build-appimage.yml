@@ -1,0 +1,281 @@
+name: Build and Release Tabula AppImage
+
+on:
+  #schedule:
+  #  - cron: '0 0 * * *' # Check upstream daily at 00:00 UTC
+  workflow_dispatch:      # Manual trigger
+    inputs:
+      force_build:
+        description: 'Force build even if tag already exists locally'
+        required: false
+        type: boolean
+        default: false
+      version_override:
+        description: 'Target specific upstream release tag (e.g., v1.2.1)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      has_builds: ${{ steps.check.outputs.has_builds }}
+      build_matrix: ${{ steps.check.outputs.build_matrix }}
+    steps:
+      - name: Check upstream releases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force_build }}
+          OVERRIDE_TAG: ${{ github.event.inputs.version_override }}
+        run: |
+          set -euo pipefail
+          TARGETS='[]'
+
+          if [ -n "$OVERRIDE_TAG" ]; then
+            UPSTREAM_TAG="$OVERRIDE_TAG"
+            echo "Using manual version override: $UPSTREAM_TAG"
+          else
+            UPSTREAM_TAG=$(gh api repos/tabulapdf/tabula/releases/latest --jq .tag_name 2>/dev/null || echo "")
+          fi
+
+          if [ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "null" ]; then
+            # Verify if this tag already exists as a release in the current repository
+            LOCAL_TAG_RELEASE=$(gh release view "$UPSTREAM_TAG" --json id -q .id 2>/dev/null || echo "")
+
+            if [ "$FORCE" = "true" ] || [ -z "$LOCAL_TAG_RELEASE" ]; then
+              echo "Scheduling build for upstream release: $UPSTREAM_TAG"
+              TARGETS=$(jq -c --arg tag "$UPSTREAM_TAG" '. += [{
+                "build_type": "tag",
+                "ref": $tag,
+                "release_tag": $tag,
+                "version_name": $tag,
+                "prerelease": false,
+                "title": ("Tabula " + $tag)
+              }]' <<< "$TARGETS")
+            else
+              echo "Release $UPSTREAM_TAG is already published locally."
+            fi
+          else
+            echo "Failed to query upstream latest release."
+          fi
+
+          TARGET_COUNT=$(jq '. | length' <<< "$TARGETS")
+          if [ "$TARGET_COUNT" -gt 0 ]; then
+            echo "has_builds=true" >> "$GITHUB_OUTPUT"
+            echo "build_matrix=$TARGETS" >> "$GITHUB_OUTPUT"
+            echo "Scheduled builds: $TARGETS"
+          else
+            echo "has_builds=false" >> "$GITHUB_OUTPUT"
+            echo "No new upstream releases found. Skipping build."
+          fi
+
+  build-appimage:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.has_builds == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.check-upstream.outputs.build_matrix) }}
+
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: 1
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            wget curl jq file icoutils zsync unzip
+
+      - name: Install appimagetool
+        run: |
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O /tmp/appimagetool.AppImage
+          chmod +x /tmp/appimagetool.AppImage
+          cd /tmp && ./appimagetool.AppImage --appimage-extract
+          sudo mv /tmp/squashfs-root /opt/appimagetool
+          sudo ln -sf /opt/appimagetool/AppRun /usr/local/bin/appimagetool
+
+      - name: Create AppDir Skeleton
+        run: |
+          mkdir -p AppDir/usr/bin \
+                   AppDir/usr/lib/jvm \
+                   AppDir/usr/share/tabula \
+                   AppDir/usr/share/applications \
+                   AppDir/usr/share/metainfo \
+                   AppDir/usr/share/icons/hicolor/256x256/apps
+
+      - name: Download & Extract Eclipse Temurin OpenJDK 8 JRE
+        run: |
+          echo "Fetching latest Eclipse Temurin 8 JRE for Linux x64..."
+          curl -sSL "https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jre/hotspot/normal/eclipse" -o /tmp/temurin-jre8.tar.gz
+          tar -xzf /tmp/temurin-jre8.tar.gz -C AppDir/usr/lib/jvm --strip-components=1
+
+          # Strip unneeded assets to minimize binary size
+          rm -rf AppDir/usr/lib/jvm/man \
+                 AppDir/usr/lib/jvm/legal \
+                 AppDir/usr/lib/jvm/demo \
+                 AppDir/usr/lib/jvm/sample
+
+      - name: Download & Stage Tabula JAR
+        run: |
+          RAW_TAG="${{ matrix.target.ref }}"
+          CLEAN_VERSION="${RAW_TAG#v}"
+
+          echo "Downloading Tabula JAR package for version ${CLEAN_VERSION}..."
+          curl -sSL "https://github.com/tabulapdf/tabula/releases/download/${RAW_TAG}/tabula-jar-${CLEAN_VERSION}.zip" -o /tmp/tabula-jar.zip
+          unzip -q /tmp/tabula-jar.zip -d /tmp/tabula_extracted
+
+          JAR_FILE=$(find /tmp/tabula_extracted -type f -name "*.jar" | head -n 1)
+          if [ -z "$JAR_FILE" ]; then
+            echo "Error: tabula.jar not found in downloaded release zip." >&2
+            exit 1
+          fi
+
+          cp "$JAR_FILE" AppDir/usr/share/tabula/tabula.jar
+
+      - name: Extract and Stage Application Icons
+        run: |
+          echo "Fetching official Tabula icon..."
+          curl -sSL "https://raw.githubusercontent.com/tabulapdf/tabula/master/build/icons/tabula.ico" -o /tmp/tabula.ico
+
+          mkdir -p /tmp/icons
+          icotool -x /tmp/tabula.ico -o /tmp/icons/
+
+          # Identify highest-resolution extracted PNG frame
+          LARGEST_ICON=$(ls -S /tmp/icons/*.png | head -n 1)
+          cp "$LARGEST_ICON" AppDir/tabula.png
+          cp "$LARGEST_ICON" AppDir/.DirIcon
+          cp "$LARGEST_ICON" AppDir/usr/share/icons/hicolor/256x256/apps/tabula.png
+
+      - name: Deploy AppRun and Desktop Integration Metadata
+        run: |
+          # Use committed repository files or generate inline fallbacks
+          if [ -f "AppRun" ]; then
+            cp "AppRun" AppDir/AppRun
+          else
+            cat << 'EOF' > AppDir/AppRun
+          #!/usr/bin/env bash
+          set -e
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export JAVA_HOME="${HERE}/usr/lib/jvm"
+          export PATH="${JAVA_HOME}/bin:${PATH}"
+          TABULA_PORT="${TABULA_PORT:-8080}"
+          TABULA_JAR="${HERE}/usr/share/tabula/tabula.jar"
+
+          is_port_in_use() {
+            local port="$1"
+            if (exec 3<>/dev/tcp/127.0.0.1/"${port}") 2>/dev/null; then
+              exec 3>&-; return 0
+            fi
+            return 1
+          }
+
+          PORT_SCAN_LIMIT=10
+          while is_port_in_use "${TABULA_PORT}"; do
+            TABULA_PORT=$((TABULA_PORT + 1))
+            PORT_SCAN_LIMIT=$((PORT_SCAN_LIMIT - 1))
+            if [ "${PORT_SCAN_LIMIT}" -le 0 ]; then exit 1; fi
+          done
+
+          JVM_OPTS=("-Dfile.encoding=utf-8" "-Xms256M" "-Xmx1024M" "-Dwarbler.port=${TABULA_PORT}")
+          OPEN_BROWSER="true"
+          USER_ARGS=()
+          for arg in "$@"; do
+            case "$arg" in
+              --no-browser|-n) OPEN_BROWSER="false" ;;
+              *) USER_ARGS+=("$arg") ;;
+            esac
+          done
+
+          if [ "${OPEN_BROWSER}" = "true" ]; then
+            JVM_OPTS+=("-Dtabula.openBrowser=true")
+          else
+            JVM_OPTS+=("-Dtabula.openBrowser=false")
+          fi
+
+          exec "${JAVA_HOME}/bin/java" "${JVM_OPTS[@]}" ${TABULA_JAVA_OPTS:-} -jar "${TABULA_JAR}" "${USER_ARGS[@]}"
+          EOF
+          fi
+          chmod +x AppDir/AppRun
+
+          # Desktop file
+          if [ -f "tabula.desktop" ]; then
+            cp "tabula.desktop" AppDir/tabula.desktop
+            cp "tabula.desktop" AppDir/usr/share/applications/tabula.desktop
+          else
+            cat << 'EOF' > AppDir/tabula.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Tabula
+          GenericName=PDF Table Extractor
+          Comment=Extract tables trapped inside PDF files into CSV or spreadsheets
+          Exec=AppRun %F
+          Icon=tabula
+          Terminal=false
+          Categories=Office;Utility;
+          MimeType=application/pdf;
+          Keywords=pdf;table;extract;csv;data;spreadsheet;
+          StartupWMClass=org-nerdpower-tabula-Tabula
+          EOF
+            cp AppDir/tabula.desktop AppDir/usr/share/applications/tabula.desktop
+          fi
+
+          # AppStream metadata
+          if [ -f "technology.tabula.appdata.xml" ]; then
+            cp "technology.tabula.appdata.xml" AppDir/usr/share/metainfo/technology.tabula.appdata.xml
+          fi
+
+      - name: Package AppImage and Generate Hashes
+        run: |
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          VERSION_NAME="${{ matrix.target.version_name }}"
+
+          # Embedded RFC-compliant update string pointing to the latest generic release
+          UPDATE_INFORMATION="gh-releases-zsync|${REPO_OWNER}|${REPO_NAME}|latest|Tabula-x86_64.AppImage.zsync"
+
+          # 1. Build generic AppImage and generate matching generic zsync file
+          appimagetool -n -u "$UPDATE_INFORMATION" AppDir "Tabula-x86_64.AppImage"
+
+          # 2. Duplicate binary as version-specific asset
+          cp "Tabula-x86_64.AppImage" "Tabula-${VERSION_NAME}-x86_64.AppImage"
+
+          # 3. Generate SHA256 checksums
+          sha256sum "Tabula-x86_64.AppImage" > "Tabula-x86_64.AppImage.sha256"
+          sha256sum "Tabula-${VERSION_NAME}-x86_64.AppImage" > "Tabula-${VERSION_NAME}-x86_64.AppImage.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.target.release_tag }}
+          name: ${{ matrix.target.title }}
+          prerelease: ${{ matrix.target.prerelease }}
+          make_latest: true
+          body: |
+            Automated AppImage bundle tracking upstream `tabulapdf/tabula`.
+
+            - **Upstream Tag:** ${{ matrix.target.ref }}
+            - **Bundled JRE:** Eclipse Temurin OpenJDK 8 JRE (Linux x64)
+            - **Architecture:** Linux x86_64
+
+            ### Direct Download Links
+            - [Latest Generic AppImage](https://github.com/${{ github.repository }}/releases/download/${{ matrix.target.release_tag }}/Tabula-x86_64.AppImage)
+            - [Version-Specific AppImage](https://github.com/${{ github.repository }}/releases/download/${{ matrix.target.release_tag }}/Tabula-${{ matrix.target.version_name }}-x86_64.AppImage)
+            - [Zsync Delta File](https://github.com/${{ github.repository }}/releases/download/${{ matrix.target.release_tag }}/Tabula-x86_64.AppImage.zsync)
+          files: |
+            Tabula-x86_64.AppImage
+            Tabula-x86_64.AppImage.zsync
+            Tabula-x86_64.AppImage.sha256
+            Tabula-${{ matrix.target.version_name }}-x86_64.AppImage
+            Tabula-${{ matrix.target.version_name }}-x86_64.AppImage.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
