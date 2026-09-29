@@ -7,18 +7,46 @@ set -e
 # Resolve directory of AppImage mount point
 HERE="$(dirname "$(readlink -f "${0}")")"
 
-# Configure bundled Eclipse Temurin JRE
-export JAVA_HOME="${HERE}/usr/lib/jvm"
+# 1. Dynamically locate the bundled Java binary
+if [ -x "${HERE}/usr/lib/jvm/bin/java" ]; then
+  JAVA_BIN="${HERE}/usr/lib/jvm/bin/java"
+  JAVA_HOME="${HERE}/usr/lib/jvm"
+else
+  # Search within usr/lib/jvm in case of archive hierarchy variations
+  JAVA_BIN=$(find "${HERE}/usr/lib/jvm" -type f -name "java" -perm -111 2>/dev/null | head -n 1)
+  if [ -n "${JAVA_BIN}" ]; then
+    JAVA_HOME="$(dirname "$(dirname "${JAVA_BIN}")")"
+  elif command -v java >/dev/null 2>&1; then
+    echo "[Tabula] Warning: Bundled JRE not found, falling back to system java." >&2
+    JAVA_BIN="$(command -v java)"
+    JAVA_HOME="$(dirname "$(dirname "$(readlink -f "${JAVA_BIN}")")")"
+  else
+    echo "[Tabula] Fatal Error: No Java runtime found." >&2
+    exit 1
+  fi
+fi
+
+export JAVA_HOME
 export PATH="${JAVA_HOME}/bin:${PATH}"
 
-# Preserve pristine host environment for external apps (e.g., host browser)
+# Preserve original environment for external processes (e.g. host web browser)
 export ORIGINAL_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 
-# Runtime defaults
-TABULA_PORT="${TABULA_PORT:-8080}"
+# Locate Tabula JAR
 TABULA_JAR="${HERE}/usr/share/tabula/tabula.jar"
+if [ ! -f "${TABULA_JAR}" ]; then
+  TABULA_JAR=$(find "${HERE}/usr/share/tabula" -type f -name "*.jar" 2>/dev/null | head -n 1)
+fi
 
-# Verify socket availability to avoid collisions on port 8080
+if [ ! -f "${TABULA_JAR}" ]; then
+  echo "[Tabula] Fatal Error: tabula.jar not found inside AppImage." >&2
+  exit 1
+fi
+
+# Configurable options
+TABULA_PORT="${TABULA_PORT:-8080}"
+
+# Check port availability
 is_port_in_use() {
   local port="$1"
   # 1. Native Bash /dev/tcp test
@@ -75,5 +103,5 @@ else
   JVM_OPTS+=("-Dtabula.openBrowser=false")
 fi
 
-# Hand over process control to Java to guarantee deterministic signal propagation (SIGINT/SIGTERM)
-exec "${JAVA_HOME}/bin/java" "${JVM_OPTS[@]}" ${TABULA_JAVA_OPTS:-} -jar "${TABULA_JAR}" "${USER_ARGS[@]}"
+# Execute Tabula directly via exec to maintain clean signal propagation (SIGINT/SIGTERM)
+exec "${JAVA_BIN}" "${JVM_OPTS[@]}" ${TABULA_JAVA_OPTS:-} -jar "${TABULA_JAR}" "${USER_ARGS[@]}"

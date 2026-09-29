@@ -44,7 +44,6 @@ jobs:
           fi
 
           if [ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "null" ]; then
-            # Verify if this tag already exists as a release in the current repository
             LOCAL_TAG_RELEASE=$(gh release view "$UPSTREAM_TAG" --json id -q .id 2>/dev/null || echo "")
 
             if [ "$FORCE" = "true" ] || [ -z "$LOCAL_TAG_RELEASE" ]; then
@@ -116,14 +115,41 @@ jobs:
       - name: Download & Extract Eclipse Temurin OpenJDK 8 JRE
         run: |
           echo "Fetching latest Eclipse Temurin 8 JRE for Linux x64..."
-          curl -sSL "https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jre/hotspot/normal/eclipse" -o /tmp/temurin-jre8.tar.gz
-          tar -xzf /tmp/temurin-jre8.tar.gz -C AppDir/usr/lib/jvm --strip-components=1
+          curl -f -sSL "https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jre/hotspot/normal/eclipse" -o /tmp/temurin-jre8.tar.gz
 
-          # Strip unneeded assets to minimize binary size
+          # Extract into isolated staging folder to determine layout safely
+          mkdir -p /tmp/jre_staging
+          tar -xzf /tmp/temurin-jre8.tar.gz -C /tmp/jre_staging
+
+          # Find java executable dynamically
+          FOUND_JAVA=$(find /tmp/jre_staging -type f -name "java" -perm -111 2>/dev/null | head -n 1)
+          if [ -z "$FOUND_JAVA" ]; then
+            echo "Error: java binary not found in JRE archive!" >&2
+            find /tmp/jre_staging -maxdepth 3
+            exit 1
+          fi
+
+          # Resolve JRE root directory (parent of bin/)
+          JRE_ROOT="$(dirname "$(dirname "$FOUND_JAVA")")"
+          echo "Discovered JRE root directory at: $JRE_ROOT"
+
+          # Copy JRE contents into AppDir/usr/lib/jvm
+          cp -a "$JRE_ROOT"/* AppDir/usr/lib/jvm/
+          chmod +x AppDir/usr/lib/jvm/bin/*
+
+          # Strip unneeded assets
           rm -rf AppDir/usr/lib/jvm/man \
                  AppDir/usr/lib/jvm/legal \
                  AppDir/usr/lib/jvm/demo \
                  AppDir/usr/lib/jvm/sample
+
+          # Build Assertion: Fail early if java binary is not in exact expected location
+          if [ ! -x "AppDir/usr/lib/jvm/bin/java" ]; then
+            echo "Build Assertion Failed: AppDir/usr/lib/jvm/bin/java is missing or non-executable!" >&2
+            ls -la AppDir/usr/lib/jvm/
+            exit 1
+          fi
+          echo "JRE verified successfully: $(AppDir/usr/lib/jvm/bin/java -version 2>&1 | head -n 1)"
 
       - name: Download & Stage Tabula JAR
         run: |
@@ -131,7 +157,7 @@ jobs:
           CLEAN_VERSION="${RAW_TAG#v}"
 
           echo "Downloading Tabula JAR package for version ${CLEAN_VERSION}..."
-          curl -sSL "https://github.com/tabulapdf/tabula/releases/download/${RAW_TAG}/tabula-jar-${CLEAN_VERSION}.zip" -o /tmp/tabula-jar.zip
+          curl -f -sSL "https://github.com/tabulapdf/tabula/releases/download/${RAW_TAG}/tabula-jar-${CLEAN_VERSION}.zip" -o /tmp/tabula-jar.zip
           unzip -q /tmp/tabula-jar.zip -d /tmp/tabula_extracted
 
           JAR_FILE=$(find /tmp/tabula_extracted -type f -name "*.jar" | head -n 1)
@@ -141,6 +167,9 @@ jobs:
           fi
 
           cp "$JAR_FILE" AppDir/usr/share/tabula/tabula.jar
+
+          # Build Assertion
+          test -f "AppDir/usr/share/tabula/tabula.jar" || { echo "tabula.jar missing!"; exit 1; }
 
       - name: Extract and Stage Application Icons
         run: |
@@ -162,74 +191,19 @@ jobs:
           if [ -f "AppRun" ]; then
             cp "AppRun" AppDir/AppRun
           else
-            cat << 'EOF' > AppDir/AppRun
-          #!/usr/bin/env bash
-          set -e
-          HERE="$(dirname "$(readlink -f "${0}")")"
-          export JAVA_HOME="${HERE}/usr/lib/jvm"
-          export PATH="${JAVA_HOME}/bin:${PATH}"
-          TABULA_PORT="${TABULA_PORT:-8080}"
-          TABULA_JAR="${HERE}/usr/share/tabula/tabula.jar"
-
-          is_port_in_use() {
-            local port="$1"
-            if (exec 3<>/dev/tcp/127.0.0.1/"${port}") 2>/dev/null; then
-              exec 3>&-; return 0
-            fi
-            return 1
-          }
-
-          PORT_SCAN_LIMIT=10
-          while is_port_in_use "${TABULA_PORT}"; do
-            TABULA_PORT=$((TABULA_PORT + 1))
-            PORT_SCAN_LIMIT=$((PORT_SCAN_LIMIT - 1))
-            if [ "${PORT_SCAN_LIMIT}" -le 0 ]; then exit 1; fi
-          done
-
-          JVM_OPTS=("-Dfile.encoding=utf-8" "-Xms256M" "-Xmx1024M" "-Dwarbler.port=${TABULA_PORT}")
-          OPEN_BROWSER="true"
-          USER_ARGS=()
-          for arg in "$@"; do
-            case "$arg" in
-              --no-browser|-n) OPEN_BROWSER="false" ;;
-              *) USER_ARGS+=("$arg") ;;
-            esac
-          done
-
-          if [ "${OPEN_BROWSER}" = "true" ]; then
-            JVM_OPTS+=("-Dtabula.openBrowser=true")
-          else
-            JVM_OPTS+=("-Dtabula.openBrowser=false")
-          fi
-
-          exec "${JAVA_HOME}/bin/java" "${JVM_OPTS[@]}" ${TABULA_JAVA_OPTS:-} -jar "${TABULA_JAR}" "${USER_ARGS[@]}"
-          EOF
+            echo "Error: AppRun file is missing from repository." >&2
+            exit 1
           fi
           chmod +x AppDir/AppRun
 
-          # Desktop file
           if [ -f "tabula.desktop" ]; then
             cp "tabula.desktop" AppDir/tabula.desktop
             cp "tabula.desktop" AppDir/usr/share/applications/tabula.desktop
           else
-            cat << 'EOF' > AppDir/tabula.desktop
-          [Desktop Entry]
-          Type=Application
-          Name=Tabula
-          GenericName=PDF Table Extractor
-          Comment=Extract tables trapped inside PDF files into CSV or spreadsheets
-          Exec=AppRun %F
-          Icon=tabula
-          Terminal=false
-          Categories=Office;Utility;
-          MimeType=application/pdf;
-          Keywords=pdf;table;extract;csv;data;spreadsheet;
-          StartupWMClass=org-nerdpower-tabula-Tabula
-          EOF
-            cp AppDir/tabula.desktop AppDir/usr/share/applications/tabula.desktop
+            echo "Error: tabula.desktop file is missing from repository." >&2
+            exit 1
           fi
 
-          # AppStream metadata
           if [ -f "technology.tabula.appdata.xml" ]; then
             cp "technology.tabula.appdata.xml" AppDir/usr/share/metainfo/technology.tabula.appdata.xml
           fi
