@@ -8,6 +8,9 @@ set -u
 # Resolve AppImage mount directory
 HERE="$(dirname "$(readlink -f "${0}")")"
 
+# Preserve host LD_LIBRARY_PATH before we modify it
+export ORIG_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+
 # ------------------------------------------------------------------------------
 # 1. Locate Java Runtime (Bundled JRE with Host Fallback)
 # ------------------------------------------------------------------------------
@@ -27,7 +30,7 @@ else
   fi
 fi
 
-# Pre-flight execution check: Verify that JAVA_BIN can actually execute on this kernel/distro
+# Pre-flight execution check: Verify that JAVA_BIN can actually execute on this host
 CAN_EXEC_BUNDLED=false
 if [ -n "${JAVA_BIN}" ] && [ -x "${JAVA_BIN}" ]; then
   if "${JAVA_BIN}" -version >/dev/null 2>&1; then
@@ -39,7 +42,7 @@ if [ "${CAN_EXEC_BUNDLED}" = "true" ]; then
   export JAVA_HOME
   export PATH="${JAVA_HOME}/bin:${PATH}"
 else
-  # Bundled JRE is missing or incompatible with host libc/kernel (e.g. NixOS/Alpine/musl)
+  # Bundled JRE is missing or incompatible with host libc/kernel (e.g., NixOS/musl)
   if command -v java >/dev/null 2>&1 && java -version >/dev/null 2>&1; then
     echo "[Tabula] Notice: Bundled JRE is incompatible with host environment. Falling back to system Java."
     JAVA_BIN="$(command -v java)"
@@ -83,7 +86,7 @@ fi
 is_port_available() {
   local port="$1"
 
-  # Tier 1: Python 3 socket bind test (most accurate)
+  # Tier 1: Python 3 socket bind test
   if command -v python3 >/dev/null 2>&1; then
     python3 -c "import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -159,20 +162,28 @@ fi
 echo "[Tabula] Launching Tabula server on http://127.0.0.1:${CURRENT_PORT}/"
 
 # ------------------------------------------------------------------------------
-# 4. Process Flags and Launch
+# 4. Library Path and Environment Setup
 # ------------------------------------------------------------------------------
 # Writable, exec-capable temp dir and a stable working directory
 TABULA_HOME_DIR="${TABULA_DATA_PATH:-${XDG_DATA_HOME:-$HOME/.local/share}/tabula}"
 mkdir -p "${TABULA_HOME_DIR}/tmp"
 cd "${TABULA_HOME_DIR}" || cd "$HOME" || exit 1
 
-# Note: Passes CURRENT_PORT rather than the static TABULA_PORT
+# Prepend AppDir/usr/bin so our sanitizing xdg-open wrapper handles browser calls
+export PATH="${HERE}/usr/bin:${PATH}"
+
+# Point LD_LIBRARY_PATH to bundled libraries
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/lib/jvm/lib/amd64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+# Configure JVM and JNR-FFI native lookup paths directly
 JVM_OPTS=(
   "-Dfile.encoding=utf-8"
   "-Xms256M"
   "-Xmx1024M"
   "-Dwarbler.port=${CURRENT_PORT}"
   "-Djava.io.tmpdir=${TABULA_HOME_DIR}/tmp"
+  "-Djava.library.path=${HERE}/usr/lib:${HERE}/usr/lib/jvm/lib/amd64"
+  "-Djnr.ffi.library.path=${HERE}/usr/lib"
   #"-Djruby.native.verbose=true" # comment out to reduce log noise
 )
 
@@ -196,7 +207,5 @@ else
   JVM_OPTS+=("-Dtabula.openBrowser=false")
 fi
 
-# limit what the library path exposes. LD_LIBRARY_PATH is inherited by child processes, such as the browser launched via xdg-open. Right now usr/lib contains only libcrypt (the JRE lives in usr/lib/jvm), so the exposure is tiny. If more libraries are bundled later, put them in a subdirectory like usr/lib/compat and point LD_LIBRARY_PATH there instead.
-export LD_LIBRARY_PATH="${HERE}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-# Execute Tabula directly via exec to maintain clean signal propagation (SIGINT/SIGTERM)
+# Execute Tabula directly via exec to maintain clean signal propagation
 exec "${JAVA_BIN}" "${JVM_OPTS[@]}" ${TABULA_JAVA_OPTS:-} -jar "${TABULA_JAR}" "${USER_ARGS[@]}"

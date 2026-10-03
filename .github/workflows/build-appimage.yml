@@ -93,7 +93,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            wget curl jq file icoutils zsync unzip
+            wget curl jq file icoutils zsync unzip \
+            libcrypt1 libcrypt-dev libfreetype6 libasound2
 
       - name: Install appimagetool
         run: |
@@ -106,6 +107,7 @@ jobs:
       - name: Create AppDir Skeleton
         run: |
           mkdir -p AppDir/usr/bin \
+                   AppDir/usr/lib \
                    AppDir/usr/lib/jvm \
                    AppDir/usr/share/tabula \
                    AppDir/usr/share/applications \
@@ -125,7 +127,6 @@ jobs:
           FOUND_JAVA=$(find /tmp/jre_staging -type f -name "java" -perm -111 2>/dev/null | head -n 1)
           if [ -z "$FOUND_JAVA" ]; then
             echo "Error: java binary not found in JRE archive!" >&2
-            find /tmp/jre_staging -maxdepth 3
             exit 1
           fi
 
@@ -146,13 +147,13 @@ jobs:
           # Build Assertion: Fail early if java binary is not in exact expected location
           if [ ! -x "AppDir/usr/lib/jvm/bin/java" ]; then
             echo "Build Assertion Failed: AppDir/usr/lib/jvm/bin/java is missing or non-executable!" >&2
-            ls -la AppDir/usr/lib/jvm/
             exit 1
           fi
           echo "JRE verified successfully: $(AppDir/usr/lib/jvm/bin/java -version 2>&1 | head -n 1)"
 
-      - name: Download & Stage Tabula JAR
+      - name: Download & Stage Tabula JAR (with Custom tabula-java Backend)
         run: |
+          set -euo pipefail
           RAW_TAG="${{ matrix.target.ref }}"
           CLEAN_VERSION="${RAW_TAG#v}"
 
@@ -170,6 +171,105 @@ jobs:
 
           # Build Assertion
           test -f "AppDir/usr/share/tabula/tabula.jar" || { echo "tabula.jar missing!"; exit 1; }
+
+      - name: Resolve and Bundle Dynamic & Runtime Dependencies
+        run: |
+          set -euo pipefail
+          echo "=== Resolving dependencies for AppDir ==="
+
+          # 1. Unpack any internal JFFI/JNI native libs from inside tabula.jar so ldd can inspect them
+          mkdir -p /tmp/jar_natives
+          unzip -q -o "AppDir/usr/share/tabula/tabula.jar" "*.so" -d /tmp/jar_natives 2>/dev/null || true
+
+          # 2. Exclude pattern: Core glibc, display/graphics drivers, direct X11 client libs and wayland libs
+          EXCLUDE_REGEX='^(libc\.so|ld-linux|libdl\.so|libm\.so|libpthread\.so|librt\.so|libresolv\.so|libutil\.so|libnss_|libGL\.so|libEGL\.so|libGLX\.so|libGLdispatch\.so|libdrm\.so|libgbm\.so|libvulkan\.so|libX11\.so|libxcb\.so|libXau\.so|libXdmcp\.so|libwayland-)'
+
+          # 3. Discover all ELF files across the JRE and extracted JAR internals
+          mapfile -t ELF_FILES < <(find AppDir/usr/lib/jvm /tmp/jar_natives -type f -exec file {} + | grep -E "ELF .* (executable|shared object)" | cut -d: -f1)
+
+          TARGET_LIB_DIR="AppDir/usr/lib"
+          mkdir -p "$TARGET_LIB_DIR"
+
+          # 4. Iteratively resolve dependencies via ldd
+          RESOLVED_DEPS=$(mktemp)
+          for elf in "${ELF_FILES[@]}"; do
+            ldd "$elf" 2>/dev/null | awk '/=> \// {print $3}' >> "$RESOLVED_DEPS" || true
+          done
+
+          # Filter and copy dependencies
+          sort -u "$RESOLVED_DEPS" | while read -r lib_path; do
+            [ -z "$lib_path" ] && continue
+            lib_name=$(basename "$lib_path")
+            if echo "$lib_name" | grep -E -q "$EXCLUDE_REGEX"; then
+              continue
+            fi
+            if [ ! -f "$TARGET_LIB_DIR/$lib_name" ]; then
+              echo "Bundling detected ELF dependency: $lib_name from $lib_path"
+              cp -L "$lib_path" "$TARGET_LIB_DIR/"
+            fi
+          done
+          rm -f "$RESOLVED_DEPS"
+
+          # 5. Explicitly bundle runtime dlopen() targets (like libcrypt for JRuby)
+          # These are not in DT_NEEDED headers and will be missed by ldd!
+          LIBCRYPT_SRC=$(ldconfig -p | grep 'libcrypt\.so\.1' | head -n 1 | awk '{print $NF}')
+          if [ -n "$LIBCRYPT_SRC" ] && [ -f "$LIBCRYPT_SRC" ]; then
+            echo "Bundling libcrypt from: $LIBCRYPT_SRC"
+            cp -L "$LIBCRYPT_SRC" "$TARGET_LIB_DIR/libcrypt.so.1"
+          else
+            echo "Error: libcrypt.so.1 could not be located on the build host!" >&2
+            exit 1
+          fi
+
+          # Provide canonical symlinks (JRuby sometimes asks for libcrypt.so instead of .so.1)
+          cd "$TARGET_LIB_DIR"
+          ln -sf "libcrypt.so.1" "libcrypt.so"
+          
+          # Ensure soname symlinks exist for all bundled libraries
+          for lib in *.so*; do
+            [ -f "$lib" ] || continue
+            soname=$(objdump -p "$lib" 2>/dev/null | awk '/SONAME/ {print $2}' || true)
+            if [ -n "$soname" ] && [ ! -e "$soname" ]; then
+              ln -sf "$lib" "$soname"
+            fi
+          done
+          cd - >/dev/null
+
+          echo "Bundled libraries in $TARGET_LIB_DIR:"
+          ls -la "$TARGET_LIB_DIR"
+
+      - name: Deploy Browser Bridge Wrapper for xdg-open
+        run: |
+          # Create a wrapper for xdg-open to sanitize LD_LIBRARY_PATH when Tabula triggers the host browser
+          cat << 'EOF' > AppDir/usr/bin/xdg-open
+          #!/usr/bin/env bash
+          # Restore original host library path so the host browser does not inherit bundled AppImage libs
+          if [ -n "${ORIG_LD_LIBRARY_PATH+x}" ]; then
+            export LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}"
+          else
+            unset LD_LIBRARY_PATH
+          fi
+
+          # Remove AppDir paths from PATH when invoking host xdg-open
+          CLEAN_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "^${APPDIR:-/tmp/nonexistent}" | paste -sd:)
+          PATH="$CLEAN_PATH"
+
+          # Locate system xdg-open
+          SYS_XDG_OPEN=$(which xdg-open 2>/dev/null || true)
+          if [ -n "$SYS_XDG_OPEN" ] && [ "$SYS_XDG_OPEN" != "$0" ]; then
+            exec "$SYS_XDG_OPEN" "$@"
+          else
+            # Fallback if xdg-open is not installed
+            for browser in x-www-browser firefox google-chrome chromium chromium-browser; do
+              if command -v "$browser" >/dev/null 2>&1; then
+                exec "$browser" "$@"
+              fi
+            done
+            echo "[Tabula] Warning: No host browser launcher found." >&2
+            exit 1
+          fi
+          EOF
+          chmod +x AppDir/usr/bin/xdg-open
 
       - name: Extract and Stage Application Icons
         run: |
@@ -208,12 +308,6 @@ jobs:
             cp "technology.tabula.appdata.xml" AppDir/usr/share/metainfo/technology.tabula.appdata.xml
           fi
 
-      - name: Bundle libcrypt.so.1
-        run: |
-          mkdir -p AppDir/usr/lib
-          cp -L /lib/x86_64-linux-gnu/libcrypt.so.1 AppDir/usr/lib/
-          test -f AppDir/usr/lib/libcrypt.so.1 || { echo "libcrypt.so.1 missing! Try another source to get it from." >&2; exit 1; }
-      
       - name: Package AppImage and Generate Hashes
         run: |
           REPO_OWNER="${GITHUB_REPOSITORY%/*}"
