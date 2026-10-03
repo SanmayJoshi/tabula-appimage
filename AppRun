@@ -12,6 +12,39 @@ HERE="$(dirname "$(readlink -f "${0}")")"
 export ORIG_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 
 # ------------------------------------------------------------------------------
+# 0. Terminal Self-Spawn for Direct GUI Invocations (e.g., File Manager Double-Click)
+# ------------------------------------------------------------------------------
+if [ ! -t 0 ] && [ ! -t 1 ] && [ -z "${TABULA_REEXEC:-}" ]; then
+  export TABULA_REEXEC=1
+  TARGET_BIN="${APPIMAGE:-$0}"
+
+  for term in xdg-terminal-exec konsole gnome-terminal xfce4-terminal foot kitty alacritty urxvt xterm; do
+    if command -v "$term" >/dev/null 2>&1; then
+      case "$term" in
+        xdg-terminal-exec)
+          exec env LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}" "$term" "$TARGET_BIN" "$@"
+          ;;
+        konsole)
+          exec env LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}" "$term" --nofork -e "$TARGET_BIN" "$@"
+          ;;
+        gnome-terminal)
+          exec env LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}" "$term" --wait -- "$TARGET_BIN" "$@"
+          ;;
+        xfce4-terminal)
+          exec env LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}" "$term" --disable-server -x "$TARGET_BIN" "$@"
+          ;;
+        kitty|foot)
+          exec env LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}" "$term" "$TARGET_BIN" "$@"
+          ;;
+        *)
+          exec env LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}" "$term" -e "$TARGET_BIN" "$@"
+          ;;
+      esac
+    fi
+  done
+fi
+
+# ------------------------------------------------------------------------------
 # 1. Locate Java Runtime (Bundled JRE with Host Fallback)
 # ------------------------------------------------------------------------------
 JAVA_BIN=""
