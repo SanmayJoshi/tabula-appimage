@@ -323,39 +323,6 @@ jobs:
           echo "Final bundled libraries in $TARGET_LIB_DIR:"
           ls -la "$TARGET_LIB_DIR"
 
-      - name: Deploy Browser Bridge Wrapper for xdg-open
-        run: |
-          # Create a wrapper for xdg-open to sanitize LD_LIBRARY_PATH when Tabula triggers the host browser
-          cat << 'EOF' > AppDir/usr/bin/xdg-open
-          #!/usr/bin/env bash
-          # Restore original host library path so the host browser does not inherit bundled AppImage libs
-          if [ -n "${ORIG_LD_LIBRARY_PATH+x}" ]; then
-            export LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH}"
-          else
-            unset LD_LIBRARY_PATH
-          fi
-
-          # Remove AppDir paths from PATH when invoking host xdg-open
-          CLEAN_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "^${APPDIR:-/tmp/nonexistent}" | paste -sd:)
-          PATH="$CLEAN_PATH"
-
-          # Locate system xdg-open
-          SYS_XDG_OPEN=$(which xdg-open 2>/dev/null || true)
-          if [ -n "$SYS_XDG_OPEN" ] && [ "$SYS_XDG_OPEN" != "$0" ]; then
-            exec "$SYS_XDG_OPEN" "$@"
-          else
-            # Fallback if xdg-open is not installed
-            for browser in x-www-browser firefox google-chrome chromium chromium-browser; do
-              if command -v "$browser" >/dev/null 2>&1; then
-                exec "$browser" "$@"
-              fi
-            done
-            echo "[Tabula] Warning: No host browser launcher found." >&2
-            exit 1
-          fi
-          EOF
-          chmod +x AppDir/usr/bin/xdg-open
-
       - name: Extract and Stage Application Icons
         run: |
           echo "Fetching official Tabula icon..."
