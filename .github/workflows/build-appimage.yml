@@ -179,6 +179,7 @@ jobs:
           # ====================================================================
           TABULA_JAR="AppDir/usr/share/tabula/tabula.jar"
           TARGET_TABULA_JAVA_VER="1.0.5" # Set your desired version
+          echo "TARGET_TABULA_JAVA_VER=$TARGET_TABULA_JAVA_VER" >> "$GITHUB_ENV" # Export to GITHUB_ENV, to be used in release notes
 
           echo "Inspecting current tabula-java in tabula.jar..."
           unzip -l "$TABULA_JAR" | grep -E "WEB-INF/lib/tabula-.*\.jar" || true
@@ -195,8 +196,9 @@ jobs:
             -o "$PATCH_DIR/WEB-INF/lib/tabula-${TARGET_TABULA_JAVA_VER}.jar"
 
           # tabula-java 1.0.4+ requires jts-core (which was not present in tabula 1.2.1)
-          curl -f -sSL "https://repo1.maven.org/maven2/org/locationtech/jts/jts-core/1.20.0/jts-core-1.20.0.jar" \
-            -o "$PATCH_DIR/WEB-INF/lib/jts-core-1.20.0.jar"
+          TARGET_JTS_CORE_VER="1.20.0"
+          curl -f -sSL "https://repo1.maven.org/maven2/org/locationtech/jts/jts-core/${TARGET_JTS_CORE_VER}/jts-core-${TARGET_JTS_CORE_VER}.jar" \
+            -o "$PATCH_DIR/WEB-INF/lib/jts-core-${TARGET_JTS_CORE_VER}.jar"
 
           # 3. Inject new JARs into tabula.jar
           (cd "$PATCH_DIR" && zip -u "$GITHUB_WORKSPACE/$TABULA_JAR" WEB-INF/lib/*)
@@ -421,6 +423,7 @@ jobs:
             Automated AppImage bundle tracking upstream `tabulapdf/tabula`.
 
             - **Upstream Tag:** ${{ matrix.target.ref }}
+            - **Backend (`tabula-java`):** v${{ env.TARGET_TABULA_JAVA_VER }}
             - **Bundled JRE:** Eclipse Temurin OpenJDK 8 JRE (Linux x64)
             - **Architecture:** Linux x86_64
 
