@@ -172,6 +172,38 @@ jobs:
           # Build Assertion
           test -f "AppDir/usr/share/tabula/tabula.jar" || { echo "tabula.jar missing!"; exit 1; }
 
+
+          # ====================================================================
+          # Hot-swap the tabula-java backend inside tabula.jar
+          # ====================================================================
+          TABULA_JAR="AppDir/usr/share/tabula/tabula.jar"
+          TARGET_TABULA_JAVA_VER="1.0.5" # Set your desired version
+
+          echo "Inspecting current tabula-java in tabula.jar..."
+          unzip -l "$TABULA_JAR" | grep -E "WEB-INF/lib/tabula-.*\.jar" || true
+
+          # 1. Remove the old tabula-java jar from WEB-INF/lib/
+          zip -d "$TABULA_JAR" "WEB-INF/lib/tabula-*.jar"
+
+          # 2. Stage new tabula-java backend and required runtime dependencies
+          PATCH_DIR=$(mktemp -d)
+          mkdir -p "$PATCH_DIR/WEB-INF/lib"
+
+          # Fetch tabula-java from Maven Central (or replace with your own artifact URL)
+          curl -f -sSL "https://repo1.maven.org/maven2/technology/tabula/tabula/${TARGET_TABULA_JAVA_VER}/tabula-${TARGET_TABULA_JAVA_VER}.jar" \
+            -o "$PATCH_DIR/WEB-INF/lib/tabula-${TARGET_TABULA_JAVA_VER}.jar"
+
+          # tabula-java 1.0.4+ requires jts-core (which was not present in tabula 1.2.1)
+          curl -f -sSL "https://repo1.maven.org/maven2/org/locationtech/jts/jts-core/1.20.0/jts-core-1.20.0.jar" \
+            -o "$PATCH_DIR/WEB-INF/lib/jts-core-1.20.0.jar"
+
+          # 3. Inject new JARs into tabula.jar
+          (cd "$PATCH_DIR" && zip -u "$GITHUB_WORKSPACE/$TABULA_JAR" WEB-INF/lib/*)
+          rm -rf "$PATCH_DIR"
+
+          echo "Updated tabula.jar contents:"
+          unzip -l "$TABULA_JAR" | grep -E "WEB-INF/lib/(tabula|jts-core)"
+
       - name: Resolve and Bundle Dynamic & Runtime Dependencies
         run: |
           set -euo pipefail
