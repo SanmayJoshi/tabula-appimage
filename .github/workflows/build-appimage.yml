@@ -94,7 +94,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             wget curl jq file icoutils zsync unzip \
-            libcrypt1 libcrypt-dev libfreetype6 libasound2
+            libcrypt1 libcrypt-dev libfreetype6 libasound2 \
+            patchelf
 
       - name: Install appimagetool
         run: |
@@ -209,65 +210,115 @@ jobs:
           set -euo pipefail
           echo "=== Resolving dependencies for AppDir ==="
 
-          # 1. Unpack any internal JFFI/JNI native libs from inside tabula.jar so ldd can inspect them
-          mkdir -p /tmp/jar_natives
-          unzip -q -o "AppDir/usr/share/tabula/tabula.jar" "*.so" -d /tmp/jar_natives 2>/dev/null || true
-
-          # 2. Exclude pattern: Core glibc, display/graphics drivers, direct X11 client libs and wayland libs
-          EXCLUDE_REGEX='^(libc\.so|ld-linux|libdl\.so|libm\.so|libpthread\.so|librt\.so|libresolv\.so|libutil\.so|libnss_|libGL\.so|libEGL\.so|libGLX\.so|libGLdispatch\.so|libdrm\.so|libgbm\.so|libvulkan\.so|libX11\.so|libxcb\.so|libXau\.so|libXdmcp\.so|libwayland-)'
-
-          # 3. Discover all ELF files across the JRE and extracted JAR internals
-          mapfile -t ELF_FILES < <(find AppDir/usr/lib/jvm /tmp/jar_natives -type f -exec file {} + | grep -E "ELF .* (executable|shared object)" | cut -d: -f1)
-
           TARGET_LIB_DIR="AppDir/usr/lib"
           mkdir -p "$TARGET_LIB_DIR"
 
-          # 4. Iteratively resolve dependencies via ldd
-          RESOLVED_DEPS=$(mktemp)
-          for elf in "${ELF_FILES[@]}"; do
-            ldd "$elf" 2>/dev/null | awk '/=> \// {print $3}' >> "$RESOLVED_DEPS" || true
-          done
+          # 1. Unpack internal JFFI/JNI native libs from tabula.jar for inspection
+          mkdir -p /tmp/jar_natives
+          unzip -q -o "AppDir/usr/share/tabula/tabula.jar" "*.so" -d /tmp/jar_natives 2>/dev/null || true
 
-          # Filter and copy dependencies
-          sort -u "$RESOLVED_DEPS" | while read -r lib_path; do
-            [ -z "$lib_path" ] && continue
-            lib_name=$(basename "$lib_path")
-            if echo "$lib_name" | grep -E -q "$EXCLUDE_REGEX"; then
-              continue
-            fi
-            if [ ! -f "$TARGET_LIB_DIR/$lib_name" ]; then
-              echo "Bundling detected ELF dependency: $lib_name from $lib_path"
-              cp -L "$lib_path" "$TARGET_LIB_DIR/"
-            fi
-          done
-          rm -f "$RESOLVED_DEPS"
+          # 2. Exclude pattern: Core glibc, graphics drivers, direct X11/wayland host client libs
+          EXCLUDE_REGEX='^(libc\.so|ld-linux|libdl\.so|libm\.so|libpthread\.so|librt\.so|libresolv\.so|libutil\.so|libnss_|libGL\.so|libEGL\.so|libGLX\.so|libGLdispatch\.so|libdrm\.so|libgbm\.so|libvulkan\.so|libX11\.so|libxcb\.so|libXau\.so|libXdmcp\.so|libwayland-)'
 
-          # 5. Explicitly bundle runtime dlopen() targets (like libcrypt for JRuby)
-          # These are not in DT_NEEDED headers and will be missed by ldd!
+          # 3. Explicitly bundle runtime dlopen() targets (like libcrypt for JRuby) first
           LIBCRYPT_SRC=$(ldconfig -p | grep 'libcrypt\.so\.1' | head -n 1 | awk '{print $NF}')
           if [ -n "$LIBCRYPT_SRC" ] && [ -f "$LIBCRYPT_SRC" ]; then
-            echo "Bundling libcrypt from: $LIBCRYPT_SRC"
+            echo "Bundling initial dlopen dependency: $LIBCRYPT_SRC"
             cp -L "$LIBCRYPT_SRC" "$TARGET_LIB_DIR/libcrypt.so.1"
+            ln -sf "libcrypt.so.1" "$TARGET_LIB_DIR/libcrypt.so"
           else
             echo "Error: libcrypt.so.1 could not be located on the build host!" >&2
             exit 1
           fi
 
-          # Provide canonical symlinks (JRuby sometimes asks for libcrypt.so instead of .so.1)
+          # 4. Multi-pass iterative dependency resolution loop
+          PROCESSED_ELFS=$(mktemp)
+          ROUND=1
+
+          while true; do
+            echo "--- Dependency Resolution Pass $ROUND ---"
+            
+            # Find all ELF binaries across the JRE, JAR natives, and newly bundled libs in TARGET_LIB_DIR
+            CURRENT_ELFS=$(mktemp)
+            find AppDir/usr/lib/jvm /tmp/jar_natives "$TARGET_LIB_DIR" -type f -exec file {} + 2>/dev/null \
+              | grep -E "ELF .* (executable|shared object)" \
+              | cut -d: -f1 \
+              | sort -u > "$CURRENT_ELFS"
+
+            # Determine which ELFs have not been scanned yet
+            sort -u -o "$PROCESSED_ELFS" "$PROCESSED_ELFS"
+            UNPROCESSED_ELFS=$(comm -23 "$CURRENT_ELFS" "$PROCESSED_ELFS")
+            rm -f "$CURRENT_ELFS"
+
+            if [ -z "$UNPROCESSED_ELFS" ]; then
+              echo "No new ELFs to scan. Dependency resolution converged."
+              break
+            fi
+
+            # Collect resolved shared libraries from all un-scanned ELFs
+            NEW_DEPS=$(mktemp)
+            echo "$UNPROCESSED_ELFS" | while read -r elf; do
+              [ -n "$elf" ] || continue
+              echo "$elf" >> "$PROCESSED_ELFS"
+              ldd "$elf" 2>/dev/null | awk '/=> \// {print $3}' >> "$NEW_DEPS" || true
+            done
+
+            SORTED_DEPS=$(mktemp)
+            sort -u "$NEW_DEPS" > "$SORTED_DEPS"
+            rm -f "$NEW_DEPS"
+
+            COPIED_COUNT=0
+            while read -r lib_path; do
+              [ -n "$lib_path" ] || continue
+              lib_name=$(basename "$lib_path")
+
+              # Skip core glibc and excluded system graphics libraries
+              if echo "$lib_name" | grep -E -q "$EXCLUDE_REGEX"; then
+                continue
+              fi
+
+              # Copy newly found dependency into AppDir/usr/lib
+              if [ ! -f "$TARGET_LIB_DIR/$lib_name" ]; then
+                echo "Bundling detected dependency: $lib_name from $lib_path"
+                cp -L "$lib_path" "$TARGET_LIB_DIR/$lib_name"
+                chmod 755 "$TARGET_LIB_DIR/$lib_name"
+                COPIED_COUNT=$((COPIED_COUNT + 1))
+              fi
+            done < "$SORTED_DEPS"
+            rm -f "$SORTED_DEPS"
+
+            echo "Pass $ROUND added $COPIED_COUNT new libraries."
+            if [ "$COPIED_COUNT" -eq 0 ]; then
+              echo "Transitive resolution complete."
+              break
+            fi
+
+            ROUND=$((ROUND + 1))
+          done
+          rm -f "$PROCESSED_ELFS"
+
+          # 5. Create SONAME symlinks so linkers can find canonical names
+          echo "=== Generating SONAME symlinks ==="
           cd "$TARGET_LIB_DIR"
-          ln -sf "libcrypt.so.1" "libcrypt.so"
-          
-          # Ensure soname symlinks exist for all bundled libraries
           for lib in *.so*; do
-            [ -f "$lib" ] || continue
+            [ -f "$lib" ] && [ ! -L "$lib" ] || continue
             soname=$(objdump -p "$lib" 2>/dev/null | awk '/SONAME/ {print $2}' || true)
             if [ -n "$soname" ] && [ ! -e "$soname" ]; then
+              echo "Creating symlink: $soname -> $lib"
               ln -sf "$lib" "$soname"
             fi
           done
           cd - >/dev/null
 
-          echo "Bundled libraries in $TARGET_LIB_DIR:"
+          # 6. Apply patchelf to set RPATH to $ORIGIN
+          # Single quotes around '$ORIGIN' are mandatory to prevent bash variable expansion!
+          echo "=== Patching RPATH with patchelf ==="
+          find "$TARGET_LIB_DIR" -type f -exec file {} + | grep -E "ELF .* shared object" | cut -d: -f1 | while read -r elf; do
+            echo "Setting RPATH to \$ORIGIN on: $(basename "$elf")"
+            patchelf --set-rpath '$ORIGIN' "$elf" || true
+          done
+
+          echo "Final bundled libraries in $TARGET_LIB_DIR:"
           ls -la "$TARGET_LIB_DIR"
 
       - name: Deploy Browser Bridge Wrapper for xdg-open
