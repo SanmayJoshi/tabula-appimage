@@ -6,9 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 -->
 
-[Tabula](https://tabula.technology/) is an open-source tool for extracting data tables from PDF files into CSV format or Excel spreadsheets.
+Tabula is an open-source tool for extracting data tables from PDF files into CSV format or Excel spreadsheets.
 
 This repository provides an automated, standalone Linux AppImage for Tabula. It bundles everything needed to run the application in a single file, eliminating the need to install or configure Java on your system.
+
+[Tabula Website](https://tabula.technology/) · [Tabula on Softorage](https://softorage.com/software/tabula/)
 
 ---
 
